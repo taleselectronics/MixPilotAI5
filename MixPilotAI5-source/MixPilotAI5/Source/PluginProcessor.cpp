@@ -106,6 +106,39 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
     }
     if(filterCountdown<=0){updateFilters();filterCountdown=(int)(sampleRate*.07);}
     filterCountdown-=count;
+    // Snapshot APVTS parameters ONCE per audio block. Never do string/map lookups
+    // inside the inner sample loops: the previous implementation could perform
+    // millions of parameter lookups per second and starve the host audio thread.
+    struct Settings {
+        int type=0, slope=0;
+        bool enabled=false;
+        float frequency=1000, gain=0, q=1, amount=0, ratio=3;
+        float attackMs=10, releaseMs=100, mix=1;
+        float attackCoef=0, releaseCoef=0, sibilanceCoef=0;
+        size_t delaySamples=0;
+    };
+    std::array<Settings,slots> settings{};
+    for (int i=0;i<slots;++i) {
+        auto& cfg=settings[(size_t)i];
+        cfg.type=(int)value(id(i,"type"));
+        cfg.enabled=value(id(i,"enable"))>=.5f;
+        if (!cfg.enabled || cfg.type==0) continue;
+        cfg.frequency=value(id(i,"freq"));
+        cfg.gain=value(id(i,"gain"));
+        cfg.q=value(id(i,"q"));
+        cfg.amount=value(id(i,"amount"))*.01f;
+        cfg.ratio=juce::jmax(1.0f,value(id(i,"ratio")));
+        cfg.attackMs=juce::jmax(.1f,value(id(i,"attack")));
+        cfg.releaseMs=juce::jmax(10.0f,value(id(i,"release")));
+        cfg.mix=juce::jlimit(0.0f,1.0f,value(id(i,"mix"))*.01f);
+        cfg.slope=(int)value(id(i,"slope"));
+        cfg.attackCoef=std::exp(-1.0f/(float)(sampleRate*cfg.attackMs*.001));
+        cfg.releaseCoef=std::exp(-1.0f/(float)(sampleRate*cfg.releaseMs*.001));
+        cfg.sibilanceCoef=std::exp(-2.0f*juce::MathConstants<float>::pi*juce::jlimit(2000.0f,12000.0f,cfg.frequency)/(float)sampleRate);
+        cfg.delaySamples=(size_t)juce::jlimit(10.0,sampleRate*.999,(double)(sampleRate*cfg.releaseMs*.001));
+    }
+    const float globalWet=juce::jlimit(0.0f,1.0f,value("wet")*.01f);
+    const float globalOutput=amp(value("output"));
     float in=0,out=0,gr=0;
     const float lowCoef=std::exp(-2.0f*juce::MathConstants<float>::pi*210.0f/(float)sampleRate);
     const float hiCoef=std::exp(-2.0f*juce::MathConstants<float>::pi*4700.0f/(float)sampleRate);
@@ -113,7 +146,9 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
         float dry[2]{},y[2]{};
         float mono=0;
         for(int c=0;c<chans;++c){
-            dry[c]=b.getReadPointer(c)[n];y[c]=dry[c];
+            dry[c]=b.getReadPointer(c)[n];
+            if(!std::isfinite(dry[c]))dry[c]=0.0f;
+            y[c]=dry[c];
             in=juce::jmax(in,std::abs(dry[c]));mono+=dry[c]/chans;
             if(capturing){
                 const float x=dry[c];
@@ -128,10 +163,11 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
         const auto w=ringWrite.fetch_add(1,std::memory_order_relaxed);
         ring[(size_t)(w%spectrumSize)].store(mono,std::memory_order_relaxed);
         for(int i=0;i<slots;++i){
-            const int type=(int)value(id(i,"type"));
-            if(type==0||value(id(i,"enable"))<.5f)continue;
-            const float amount=value(id(i,"amount"))*.01f;
-            const float mix=value(id(i,"mix"))*.01f;
+            const auto& cfg=settings[(size_t)i];
+            const int type=cfg.type;
+            if(type==0||!cfg.enabled)continue;
+            const float amount=cfg.amount;
+            const float mix=cfg.mix;
             float stageInput[2]{y[0],y[1]};
             for(int c=0;c<chans;++c){
                 auto& st=stage[(size_t)c][(size_t)i];
@@ -139,18 +175,16 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
                 switch(type){
                     case 1:case 2:case 3:
                         x=st.filter.processSingleSampleRaw(x);
-                        if((type==2||type==3)&&(int)value(id(i,"slope"))==1)x=st.second.processSingleSampleRaw(x);
+                        if((type==2||type==3)&&cfg.slope==1)x=st.second.processSingleSampleRaw(x);
                         break;
                     case 4:{
-                        const float attackMs=value(id(i,"attack"));
-                        const float releaseMs=value(id(i,"release"));
-                        const float atk=std::exp(-1.0f/(float)(sampleRate*attackMs*.001));
-                        const float rel=std::exp(-1.0f/(float)(sampleRate*releaseMs*.001));
+                        const float atk=cfg.attackCoef;
+                        const float rel=cfg.releaseCoef;
                         const float power=std::abs(x);
                         const float cf=power>st.envelope?atk:rel;
                         st.envelope=cf*st.envelope+(1-cf)*power;
                         const float threshold=-6-42*amount;
-                        const float ratio=value(id(i,"ratio"));
+                        const float ratio=cfg.ratio;
                         const float over=juce::jmax(0.0f,db(st.envelope)-threshold);
                         const float target=amp(-over*(1-1/ratio));
                         st.compGain+=(target-st.compGain)*.008f;
@@ -158,7 +192,7 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
                         break;
                     }
                     case 5:{ // lightweight broadband de-esser; upgrade to split-band in future
-                        const float a=std::exp(-2.0f*juce::MathConstants<float>::pi*juce::jlimit(2000.0f,12000.0f,value(id(i,"freq")))/(float)sampleRate);
+                        const float a=cfg.sibilanceCoef;
                         st.sibilanceLp=a*st.sibilanceLp+(1-a)*x;
                         const float hi=std::abs(x-st.sibilanceLp);
                         st.envelope=.98f*st.envelope+.02f*hi;
@@ -167,9 +201,9 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
                         break;
                     }
                     case 6:{const float drive=1+amount*12;x=std::tanh(x*drive)/std::tanh(drive);break;}
-                    case 7:x*=amp(value(id(i,"gain")));break;
+                    case 7:x*=amp(cfg.gain);break;
                     case 9:{
-                        const size_t delaySamples=(size_t)juce::jlimit(10.0,sampleRate*.999,(double)(sampleRate*value(id(i,"release"))*.001));
+                        const size_t delaySamples=cfg.delaySamples;
                         auto& buffer=st.delayBuffer;
                         if(!buffer.empty()){
                             const size_t pos=st.delayPosition;
@@ -199,11 +233,10 @@ void MixPilotProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffe
                 y[1]=stageInput[1]*(1-mix)+(mid-side)*mix;
             }
         }
-        const float wet=value("wet")*.01f,output=amp(value("output"));
         for(int c=0;c<chans;++c){
-            const float result=(dry[c]*(1-wet)+y[c]*wet)*output;
+            const float result=(dry[c]*(1-globalWet)+y[c]*globalWet)*globalOutput;
             // Safety peak clamp, not true-peak limiting.
-            b.getWritePointer(c)[n]=juce::jlimit(-1.0f,1.0f,result);
+            b.getWritePointer(c)[n]=std::isfinite(result)?juce::jlimit(-1.0f,1.0f,result):0.0f;
             out=juce::jmax(out,std::abs(b.getReadPointer(c)[n]));
         }
     }
